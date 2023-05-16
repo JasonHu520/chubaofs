@@ -159,6 +159,7 @@ func (ds *DiskStorage) Close(ctx context.Context) {
 	// clean superblock
 	sb := ds.SuperBlock
 	if sb != nil {
+		sb.Close(ctx)
 		ds.SuperBlock = nil
 	}
 
