@@ -17,6 +17,7 @@ package volumemgr
 import (
 	"container/list"
 	"context"
+	"math/rand"
 	"sort"
 	"sync"
 	"time"
@@ -39,22 +40,29 @@ type allocConfig struct {
 }
 
 type idleItem struct {
-	head    *list.List
-	element *list.Element
+	head     *list.List
+	element  *list.Element
+	shardIdx int
+}
+
+type Shard struct {
+	allocatable *list.List
 }
 
 type idleVolumes struct {
-	m              map[proto.Vid]idleItem
-	allocatable    *list.List
-	notAllocatable *list.List
-
+	m                 map[proto.Vid]idleItem
+	allocatableShard  []*Shard
+	notAllocatable    *list.List
+	shardLen          int
+	allAllocatableNum int
+	nextShardIdx      int
 	sync.RWMutex
 }
 
-func (i *idleVolumes) getAllIdles() []*volume {
+func (i *idleVolumes) getOneShardIdles(shardId int) []*volume {
 	i.RLock()
-	ret := make([]*volume, 0, i.allocatable.Len())
-	head := i.allocatable.Front()
+	ret := make([]*volume, 0, i.allocatableShard[shardId].allocatable.Len())
+	head := i.allocatableShard[shardId].allocatable.Front()
 	for head != nil {
 		ret = append(ret, head.Value.(*volume))
 		head = head.Next()
@@ -66,7 +74,7 @@ func (i *idleVolumes) getAllIdles() []*volume {
 func (i *idleVolumes) statAllocatableNum() int {
 	i.RLock()
 	defer i.RUnlock()
-	return i.allocatable.Len()
+	return i.allAllocatableNum
 }
 
 func (i *idleVolumes) addAllocatable(vol *volume) {
@@ -74,8 +82,18 @@ func (i *idleVolumes) addAllocatable(vol *volume) {
 	if item, ok := i.m[vol.vid]; ok {
 		item.head.Remove(item.element)
 	}
-	e := i.allocatable.PushFront(vol)
-	i.m[vol.vid] = idleItem{element: e, head: i.allocatable}
+	curShardIdx := i.nextShardIdx
+	// Find a Shard Num <= average Shard, At initialization, this code ensures that polling inserts volume evenly in each Shard with the time complexity of O(1);
+	// At other times, insert volume into the Shard of the ShardNum < average to ensure uniformity of each Shard, O(i.shardLen);
+	// There will be no dead loop, there will definitely be one ShardNum <= average.
+	for i.allocatableShard[curShardIdx].allocatable.Len() > i.allAllocatableNum/i.shardLen {
+		curShardIdx = (curShardIdx + 1) % i.shardLen
+		continue
+	}
+	e := i.allocatableShard[curShardIdx].allocatable.PushFront(vol)
+	i.m[vol.vid] = idleItem{element: e, head: i.allocatableShard[curShardIdx].allocatable, shardIdx: curShardIdx}
+	i.nextShardIdx = curShardIdx
+	i.allAllocatableNum += 1
 	i.Unlock()
 }
 
@@ -91,9 +109,32 @@ func (i *idleVolumes) addNotAllocatable(vol *volume) {
 
 func (i *idleVolumes) delete(vid proto.Vid) {
 	i.Lock()
+	var curShardNum int
 	if item, ok := i.m[vid]; ok {
+		curShardIdx := item.shardIdx
 		item.head.Remove(item.element)
 		delete(i.m, vid)
+
+		i.allAllocatableNum -= 1
+		curShardNum = i.allocatableShard[vid].allocatable.Len()
+
+		// If the Shard volumeNum < average, there must be another Shard volume Num > average,  guarantee uniformity of each Shard, The time complexity is O(i.shardLen)
+		if curShardNum < i.allAllocatableNum/i.shardLen {
+			for idx := (curShardIdx + 1) % i.shardLen; idx < i.shardLen; idx = (idx + 1) % i.shardLen {
+				if i.allocatableShard[idx].allocatable.Len() > i.allAllocatableNum/i.shardLen {
+					// move from
+					eFrom := i.allocatableShard[idx].allocatable
+					e := eFrom.Front()
+					eFrom.Remove(e)
+
+					// move to
+					eTo := i.allocatableShard[curShardIdx].allocatable
+					i.m[e.Value.(*volume).vid] = idleItem{element: e, head: i.allocatableShard[idx].allocatable, shardIdx: curShardNum}
+					eTo.PushFront(e)
+					break
+				}
+			}
+		}
 	}
 	i.Unlock()
 }
@@ -156,10 +197,18 @@ func (v sortVid) Less(i, j int) bool { return v[i].health > v[j].health || v[i].
 func newVolumeAllocator(cfg allocConfig) *volumeAllocator {
 	idles := make(map[codemode.CodeMode]*idleVolumes)
 	for _, modeConf := range cfg.codeModes {
+		shardLen := 10
+		allocatableShard := make([]*Shard, shardLen)
+		for i := 0; i < shardLen; i++ {
+			allocatableShard[i] = &Shard{allocatable: list.New()}
+		}
 		idles[modeConf.mode] = &idleVolumes{
-			m:              make(map[proto.Vid]idleItem),
-			allocatable:    list.New(),
-			notAllocatable: list.New(),
+			m:                 make(map[proto.Vid]idleItem),
+			allocatableShard:  allocatableShard,
+			shardLen:          shardLen,
+			nextShardIdx:      0,
+			allAllocatableNum: 0,
+			notAllocatable:    list.New(),
 		}
 	}
 	return &volumeAllocator{
@@ -241,8 +290,13 @@ func (a *volumeAllocator) PreAlloc(ctx context.Context, mode codemode.CodeMode, 
 	if idleVolumes == nil {
 		return nil, 0
 	}
+	rand.Seed(time.Now().UnixNano())
+	shardIdx := rand.Intn(idleVolumes.shardLen)
+	startIdx := shardIdx
+	optionalVids := make([]proto.Vid, 0)
 
-	allIdles := idleVolumes.getAllIdles()
+GetOneShardAgain:
+	allIdles := idleVolumes.getOneShardIdles(shardIdx)
 	availableVolCount := len(allIdles)
 	allocatableScoreThreshold := a.codeModes[mode].tactic.PutQuorum - a.getShardNum(mode)
 	isEnableDiskLoad := a.isEnableDiskLoad()
@@ -251,13 +305,13 @@ func (a *volumeAllocator) PreAlloc(ctx context.Context, mode codemode.CodeMode, 
 	diskLoadThreshold := a.allocatableDiskLoadThreshold / 2
 	// optionalVids include all volume id which satisfied with our condition(idle/enough free size/health/not over disk load)
 	// all vid will range by health, the more healthier volume will range in front of the optional head
-	optionalVids := make([]proto.Vid, 0)
 
 RETRY:
 	index := 0
 	var assignable []*volume
 	span.Debugf("prealloc volume length is %d,isEnableDiskLoad:%v", len(allIdles), isEnableDiskLoad)
 	now := time.Now()
+	//fmt.Println("diskload:", diskLoadThreshold)
 	for _, volume := range allIdles {
 		volume.lock.RLock()
 		if volume.canAlloc(a.allocatableSize, scoreThreshold) && (!isEnableDiskLoad || !a.isOverload(volume.vUnits, diskLoadThreshold)) {
@@ -296,7 +350,15 @@ RETRY:
 		}
 		index++
 	}
-
+	// one shard not meet the requirement
+	if len(optionalVids) < a.allocFactor*count {
+		shardIdx = (shardIdx + 1) % idleVolumes.shardLen
+		if startIdx != shardIdx {
+			goto GetOneShardAgain
+		}
+		span.Warnf("has no assignable volume,enableDiskLoad:%v,diskLoadThreshold:%d", isEnableDiskLoad, diskLoadThreshold)
+	}
+	//fmt.Println("optionalVids:", len(optionalVids))
 	span.Infof("optional vids length is %d, vids is %v", len(optionalVids), optionalVids)
 	if a.isEnableDiskLoad() {
 		optionalVids = a.sortVidByLoad(mode, optionalVids)
